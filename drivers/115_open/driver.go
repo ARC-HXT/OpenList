@@ -226,18 +226,33 @@ func (d *Open115) Put(ctx context.Context, dstDir model.Obj, file model.FileStre
 	if err != nil {
 		return err
 	}
-	sha1 := file.GetHash().GetHash(utils.SHA1)
+
+	// ================= 修改开始 =================
+	// 1. 强制忽略源文件自带的 Hash (可能是假的或不一致的)
+	// sha1 := file.GetHash().GetHash(utils.SHA1) 
+	sha1 := "" 
+
+	// 2. 如果 Hash 为空（现在强制为空），则进行全量下载并计算 Hash
 	if len(sha1) != utils.SHA1.Width {
-		_, sha1, err = stream.CacheFullAndHash(file, &up, utils.SHA1)
+		// 关键修复：CacheFullAndHash 第一个返回值是下载到本地后的新文件对象
+		// 必须用它覆盖原本的 file 变量，否则后续 RangeRead 还是会走网络流！
+		var cachedFile model.FileStreamer
+		cachedFile, sha1, err = stream.CacheFullAndHash(file, &up, utils.SHA1)
 		if err != nil {
 			return err
 		}
+		// 将 file 指向本地缓存文件，后续操作（RangeRead）将非常快且稳定
+		file = cachedFile
 	}
+	// ================= 修改结束 =================
+
 	const PreHashSize int64 = 128 * utils.KB
 	hashSize := PreHashSize
 	if file.GetSize() < PreHashSize {
 		hashSize = file.GetSize()
 	}
+
+	// 这里的 RangeRead 现在读的是本地临时文件，速度极快且无网络波动风险
 	reader, err := file.RangeRead(http_range.Range{Start: 0, Length: hashSize})
 	if err != nil {
 		return err
@@ -246,6 +261,7 @@ func (d *Open115) Put(ctx context.Context, dstDir model.Obj, file model.FileStre
 	if err != nil {
 		return err
 	}
+
 	// 1. Init
 	resp, err := d.client.UploadInit(ctx, &sdk.UploadInitReq{
 		FileName: file.GetName(),
@@ -257,13 +273,15 @@ func (d *Open115) Put(ctx context.Context, dstDir model.Obj, file model.FileStre
 	if err != nil {
 		return err
 	}
+
 	if resp.Status == 2 {
 		up(100)
 		return nil
 	}
+
 	// 2. two way verify
 	if utils.SliceContains([]int{6, 7, 8}, resp.Status) {
-		signCheck := strings.Split(resp.SignCheck, "-") //"sign_check": "2392148-2392298" 取2392148-2392298之间的内容(包含2392148、2392298)的sha1
+		signCheck := strings.Split(resp.SignCheck, "-") //"sign_check": "2392148-2392298"
 		start, err := strconv.ParseInt(signCheck[0], 10, 64)
 		if err != nil {
 			return err
@@ -272,6 +290,8 @@ func (d *Open115) Put(ctx context.Context, dstDir model.Obj, file model.FileStre
 		if err != nil {
 			return err
 		}
+		
+		// 这里的 RangeRead 同样读的是本地文件，保证了校验数据与上传数据的一致性
 		reader, err = file.RangeRead(http_range.Range{Start: start, Length: end - start + 1})
 		if err != nil {
 			return err
@@ -297,16 +317,19 @@ func (d *Open115) Put(ctx context.Context, dstDir model.Obj, file model.FileStre
 			return nil
 		}
 	}
+
 	// 3. get upload token
 	tokenResp, err := d.client.UploadGetToken(ctx)
 	if err != nil {
 		return err
 	}
+
 	// 4. upload
 	err = d.multpartUpload(ctx, file, up, tokenResp, resp)
 	if err != nil {
 		return err
 	}
+
 	return nil
 }
 
