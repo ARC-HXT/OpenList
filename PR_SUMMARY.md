@@ -25,7 +25,7 @@ Three files modified to add detailed logging:
 
 #### `drivers/123_open/driver.go`
 - Upload lifecycle tracking (start, MD5 computation, creation, upload, polling)
-- **Most critical**: Every `complete()` poll attempt logs full API response
+- **Most critical**: Every `complete()` poll attempt logs full API response including Code, Message, Completed, and FileID - even when API returns errors
 - Timing metrics for each phase
 - Success/failure status with context
 
@@ -81,6 +81,8 @@ The key to solving this issue is in the `complete()` API response logs:
 ```log
 [123open] File: <filename> - Complete poll #N: Code=<code>, Message=<msg>, Completed=<bool>, FileID=<id>
 ```
+
+**Enhancement**: The logging now captures the full API response even when errors occur. This means we'll see the actual error Code (e.g., 20103) alongside the error Message, Completed status, and FileID value, providing complete diagnostic information for every poll attempt.
 
 This will reveal:
 - ✅ What error codes the 123open API actually returns (including the mysterious error code 20103 mentioned in comments)

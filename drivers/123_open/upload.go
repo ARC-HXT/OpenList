@@ -214,8 +214,9 @@ func (d *Open123) complete(preuploadID string) (*UploadCompleteResp, error) {
 			"preuploadID": preuploadID,
 		})
 	}, &resp)
+	// 返回响应体即使有错误，以便调用者可以记录详细信息
 	if err != nil {
-		return nil, err
+		return &resp, err
 	}
 	return &resp, nil
 }
