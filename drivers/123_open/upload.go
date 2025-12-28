@@ -20,6 +20,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/avast/retry-go"
 	"github.com/go-resty/resty/v2"
+	log "github.com/sirupsen/logrus"
 )
 
 // 创建文件 V2
@@ -43,24 +44,33 @@ func (d *Open123) create(parentFileID int64, filename string, etag string, size 
 
 // 上传分片 V2
 func (d *Open123) Upload(ctx context.Context, file model.FileStreamer, createResp *UploadCreateResp, up driver.UpdateProgress) error {
+	fileName := file.GetName()
 	uploadDomain := createResp.Data.Servers[0]
 	size := file.GetSize()
 	chunkSize := createResp.Data.SliceSize
 
+	log.Infof("[123open] Upload - file: %s, domain: %s, total size: %d, chunk size: %d",
+		fileName, uploadDomain, size, chunkSize)
+
 	ss, err := stream.NewStreamSectionReader(file, int(chunkSize), &up)
 	if err != nil {
+		log.Errorf("[123open] Upload - file: %s, failed to create stream section reader: %v", fileName, err)
 		return err
 	}
 
 	uploadNums := (size + chunkSize - 1) / chunkSize
 	thread := min(int(uploadNums), d.UploadThread)
+	log.Infof("[123open] Upload - file: %s, total chunks: %d, upload threads: %d", fileName, uploadNums, thread)
+	
 	threadG, uploadCtx := errgroup.NewOrderedGroupWithContext(ctx, thread,
 		retry.Attempts(3),
 		retry.Delay(time.Second),
 		retry.DelayType(retry.BackOffDelay))
 
+	uploadStartTime := time.Now()
 	for partIndex := range uploadNums {
 		if utils.IsCanceled(uploadCtx) {
+			log.Warnf("[123open] Upload - file: %s, context canceled at chunk %d/%d", fileName, partIndex+1, uploadNums)
 			break
 		}
 		partIndex := partIndex
@@ -74,17 +84,31 @@ func (d *Open123) Upload(ctx context.Context, file model.FileStreamer, createRes
 		b := bytes.NewBuffer(make([]byte, 0, 2048))
 		threadG.GoWithLifecycle(errgroup.Lifecycle{
 			Before: func(ctx context.Context) (err error) {
+				chunkStart := time.Now()
 				reader, err = ss.GetSectionReader(offset, size)
+				if err != nil {
+					log.Errorf("[123open] Upload - file: %s, chunk %d/%d failed to get section reader: %v",
+						fileName, partNumber, uploadNums, err)
+				} else {
+					log.Debugf("[123open] Upload - file: %s, chunk %d/%d section reader obtained in %v",
+						fileName, partNumber, uploadNums, time.Since(chunkStart))
+				}
 				return
 			},
 			Do: func(ctx context.Context) (err error) {
+				chunkStart := time.Now()
 				reader.Seek(0, io.SeekStart)
 				if sliceMD5 == "" {
 					// 把耗时的计算放在这里，避免阻塞其他协程
+					md5Start := time.Now()
 					sliceMD5, err = utils.HashReader(utils.MD5, reader)
 					if err != nil {
+						log.Errorf("[123open] Upload - file: %s, chunk %d/%d MD5 calculation failed: %v",
+							fileName, partNumber, uploadNums, err)
 						return err
 					}
+					log.Debugf("[123open] Upload - file: %s, chunk %d/%d MD5: %s (computed in %v)",
+						fileName, partNumber, uploadNums, sliceMD5, time.Since(md5Start))
 					reader.Seek(0, io.SeekStart)
 				}
 
@@ -127,14 +151,21 @@ func (d *Open123) Upload(ctx context.Context, file model.FileStreamer, createRes
 				req.Header.Add("Content-Type", w.FormDataContentType())
 				req.Header.Add("Platform", "open_platform")
 
+				uploadReqStart := time.Now()
 				res, err := base.HttpClient.Do(req)
 				if err != nil {
+					log.Errorf("[123open] Upload - file: %s, chunk %d/%d HTTP request failed after %v: %v",
+						fileName, partNumber, uploadNums, time.Since(uploadReqStart), err)
 					return err
 				}
 				defer res.Body.Close()
+				
 				if res.StatusCode != 200 {
+					log.Errorf("[123open] Upload - file: %s, chunk %d/%d HTTP status %d after %v",
+						fileName, partNumber, uploadNums, res.StatusCode, time.Since(uploadReqStart))
 					return fmt.Errorf("slice %d upload failed, status code: %d", partNumber, res.StatusCode)
 				}
+				
 				b.Reset()
 				_, err = b.ReadFrom(res.Body)
 				if err != nil {
@@ -146,11 +177,16 @@ func (d *Open123) Upload(ctx context.Context, file model.FileStreamer, createRes
 					return err
 				}
 				if resp.Code != 0 {
+					log.Errorf("[123open] Upload - file: %s, chunk %d/%d API error code %d: %s",
+						fileName, partNumber, uploadNums, resp.Code, resp.Message)
 					return fmt.Errorf("slice %d upload failed: %s", partNumber, resp.Message)
 				}
 
 				progress := 100 * float64(threadG.Success()+1) / float64(uploadNums+1)
 				up(progress)
+				
+				log.Debugf("[123open] Upload - file: %s, chunk %d/%d uploaded successfully in %v (total: %v)",
+					fileName, partNumber, uploadNums, time.Since(uploadReqStart), time.Since(chunkStart))
 				return nil
 			},
 			After: func(err error) {
@@ -160,9 +196,13 @@ func (d *Open123) Upload(ctx context.Context, file model.FileStreamer, createRes
 	}
 
 	if err := threadG.Wait(); err != nil {
+		log.Errorf("[123open] Upload - file: %s, upload failed after %v: %v",
+			fileName, time.Since(uploadStartTime), err)
 		return err
 	}
 
+	log.Infof("[123open] Upload - file: %s, all %d chunks uploaded successfully in %v",
+		fileName, uploadNums, time.Since(uploadStartTime))
 	return nil
 }
 
