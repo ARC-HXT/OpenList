@@ -226,9 +226,12 @@ func (d *Open123) Put(ctx context.Context, dstDir model.Obj, file model.FileStre
 	for i := range 60 {
 		uploadCompleteResp, err := d.complete(createResp.Data.PreuploadID)
 		
-		// 详细记录每次轮询的结果
+		// 详细记录每次轮询的结果 - 始终记录完整的响应信息
 		if err != nil {
-			log.Warnf("[123open] File: %s - Complete poll #%d: API error: %v", fileName, i+1, err)
+			// API返回了错误，但我们仍然记录响应中的所有可用信息
+			log.Warnf("[123open] File: %s - Complete poll #%d: Code=%d, Message=%s, Completed=%v, FileID=%d (API Error: %v)",
+				fileName, i+1, uploadCompleteResp.Code, uploadCompleteResp.Message,
+				uploadCompleteResp.Data.Completed, uploadCompleteResp.Data.FileID, err)
 		} else {
 			log.Infof("[123open] File: %s - Complete poll #%d: Code=%d, Message=%s, Completed=%v, FileID=%d",
 				fileName, i+1, uploadCompleteResp.Code, uploadCompleteResp.Message,
