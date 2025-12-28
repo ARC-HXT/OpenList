@@ -17,6 +17,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/server/common"
 	"github.com/OpenListTeam/tache"
 	"github.com/pkg/errors"
+	log "github.com/sirupsen/logrus"
 )
 
 type taskType uint8
@@ -180,6 +181,11 @@ func (t *FileTransferTask) RunWithNextTaskCallback(f func(nextTask *FileTransfer
 		return errors.WithMessagef(err, "failed get src [%s] file", t.SrcActualPath)
 	}
 
+	log.Infof("[Transfer] Source: %s (%s) -> Dest: %s (%s), File: %s, Size: %d bytes",
+		t.SrcStorageMp, t.SrcStorage.GetStorage().Driver,
+		t.DstStorageMp, t.DstStorage.GetStorage().Driver,
+		srcObj.GetName(), srcObj.GetSize())
+
 	if srcObj.IsDir() {
 		t.Status = "src object is dir, listing objs"
 		objs, err := op.List(t.Ctx(), t.SrcStorage, t.SrcActualPath, model.ListArgs{})
@@ -240,11 +246,16 @@ func (t *FileTransferTask) RunWithNextTaskCallback(f func(nextTask *FileTransfer
 	}
 
 	t.Status = "getting src object link"
+	linkStart := time.Now()
 	link, srcObj, err := op.Link(t.Ctx(), t.SrcStorage, t.SrcActualPath, model.LinkArgs{})
 	if err != nil {
 		return errors.WithMessagef(err, "failed get [%s] link", t.SrcActualPath)
 	}
+	log.Infof("[Transfer] Link obtained for %s in %v, URL: %s, Expiration: %v",
+		srcObj.GetName(), time.Since(linkStart), link.URL, link.Expiration)
+	
 	// any link provided is seekable
+	streamStart := time.Now()
 	ss, err := stream.NewSeekableStream(&stream.FileStream{
 		Obj: srcObj,
 		Ctx: t.Ctx(),
@@ -253,9 +264,25 @@ func (t *FileTransferTask) RunWithNextTaskCallback(f func(nextTask *FileTransfer
 		_ = link.Close()
 		return errors.WithMessagef(err, "failed get [%s] stream", t.SrcActualPath)
 	}
-	t.SetTotalBytes(ss.GetSize())
+	
+	// Log stream characteristics
+	streamSize := ss.GetSize()
+	streamHash := ss.GetHash()
+	log.Infof("[Transfer] Stream created for %s in %v, Size: %d bytes, Hash available: %v (MD5: %s)",
+		srcObj.GetName(), time.Since(streamStart), streamSize, 
+		streamHash.GetHash(utils.MD5) != "", streamHash.GetHash(utils.MD5))
+	
+	t.SetTotalBytes(streamSize)
 	t.Status = "uploading"
-	return op.Put(context.WithValue(t.Ctx(), conf.SkipHookKey, struct{}{}), t.DstStorage, t.DstActualPath, ss, t.SetProgress)
+	
+	uploadStart := time.Now()
+	err = op.Put(context.WithValue(t.Ctx(), conf.SkipHookKey, struct{}{}), t.DstStorage, t.DstActualPath, ss, t.SetProgress)
+	if err != nil {
+		log.Errorf("[Transfer] Upload failed for %s after %v: %v", srcObj.GetName(), time.Since(uploadStart), err)
+		return err
+	}
+	log.Infof("[Transfer] Upload completed for %s in %v", srcObj.GetName(), time.Since(uploadStart))
+	return nil
 }
 
 var (

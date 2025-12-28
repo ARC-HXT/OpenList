@@ -12,6 +12,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/OpenListTeam/OpenList/v4/internal/stream"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
+	log "github.com/sirupsen/logrus"
 )
 
 type Open123 struct {
@@ -156,53 +157,92 @@ func (d *Open123) Remove(ctx context.Context, obj model.Obj) error {
 }
 
 func (d *Open123) Put(ctx context.Context, dstDir model.Obj, file model.FileStreamer, up driver.UpdateProgress) (model.Obj, error) {
+	fileName := file.GetName()
+	fileSize := file.GetSize()
+	log.Infof("[123open] Starting upload - file: %s, size: %d bytes", fileName, fileSize)
+	
 	// 1. 创建文件
 	// parentFileID 父目录id，上传到根目录时填写 0
 	parentFileId, err := strconv.ParseInt(dstDir.GetID(), 10, 64)
 	if err != nil {
 		return nil, fmt.Errorf("parse parentFileID error: %v", err)
 	}
+	
 	// etag 文件md5
 	etag := file.GetHash().GetHash(utils.MD5)
-	if len(etag) < utils.MD5.Width {
+	needsCacheAndHash := len(etag) < utils.MD5.Width
+	log.Infof("[123open] File: %s - Initial hash available: %v, hash: %s", fileName, !needsCacheAndHash, etag)
+	
+	if needsCacheAndHash {
+		log.Infof("[123open] File: %s - Computing MD5 via CacheFullAndHash (this may take time for large files)", fileName)
+		cacheStart := time.Now()
 		_, etag, err = stream.CacheFullAndHash(file, &up, utils.MD5)
 		if err != nil {
+			log.Errorf("[123open] File: %s - CacheFullAndHash failed: %v", fileName, err)
 			return nil, err
 		}
+		log.Infof("[123open] File: %s - CacheFullAndHash completed in %v, MD5: %s", fileName, time.Since(cacheStart), etag)
 	}
-	createResp, err := d.create(parentFileId, file.GetName(), etag, file.GetSize(), 2, false)
+	
+	log.Infof("[123open] File: %s - Creating upload session with MD5: %s", fileName, etag)
+	createResp, err := d.create(parentFileId, fileName, etag, fileSize, 2, false)
 	if err != nil {
+		log.Errorf("[123open] File: %s - Create request failed: %v", fileName, err)
 		return nil, err
 	}
+	
+	log.Infof("[123open] File: %s - Create response: Reuse=%v, FileID=%d, PreuploadID=%s, SliceSize=%d",
+		fileName, createResp.Data.Reuse, createResp.Data.FileID, createResp.Data.PreuploadID, createResp.Data.SliceSize)
+	
 	// 是否秒传
 	if createResp.Data.Reuse {
 		// 秒传成功才会返回正确的 FileID，否则为 0
 		if createResp.Data.FileID != 0 {
+			log.Infof("[123open] File: %s - Quick upload successful (reuse), FileID: %d", fileName, createResp.Data.FileID)
 			return File{
-				FileName: file.GetName(),
-				Size:     file.GetSize(),
+				FileName: fileName,
+				Size:     fileSize,
 				FileId:   createResp.Data.FileID,
 				Type:     2,
 				Etag:     etag,
 			}, nil
 		}
+		log.Warnf("[123open] File: %s - Reuse flag is true but FileID is 0, proceeding with upload", fileName)
 	}
 
 	// 2. 上传分片
+	log.Infof("[123open] File: %s - Starting chunk upload", fileName)
+	uploadStart := time.Now()
 	err = d.Upload(ctx, file, createResp, up)
 	if err != nil {
+		log.Errorf("[123open] File: %s - Chunk upload failed after %v: %v", fileName, time.Since(uploadStart), err)
 		return nil, err
 	}
+	log.Infof("[123open] File: %s - Chunk upload completed in %v", fileName, time.Since(uploadStart))
 
-	// 3. 上传完毕
-	for range 60 {
+	// 3. 上传完毕 - 轮询等待服务器处理
+	log.Infof("[123open] File: %s - Starting complete() polling (max 60 attempts)", fileName)
+	pollStart := time.Now()
+	for i := range 60 {
 		uploadCompleteResp, err := d.complete(createResp.Data.PreuploadID)
+		
+		// 详细记录每次轮询的结果
+		if err != nil {
+			log.Warnf("[123open] File: %s - Complete poll #%d: API error: %v", fileName, i+1, err)
+		} else {
+			log.Infof("[123open] File: %s - Complete poll #%d: Code=%d, Message=%s, Completed=%v, FileID=%d",
+				fileName, i+1, uploadCompleteResp.Code, uploadCompleteResp.Message,
+				uploadCompleteResp.Data.Completed, uploadCompleteResp.Data.FileID)
+		}
+		
 		// 返回错误代码未知，如：20103，文档也没有具体说
 		if err == nil && uploadCompleteResp.Data.Completed && uploadCompleteResp.Data.FileID != 0 {
+			log.Infof("[123open] File: %s - Upload completed successfully after %d polls (%v total), FileID: %d",
+				fileName, i+1, time.Since(pollStart), uploadCompleteResp.Data.FileID)
 			up(100)
 			return File{
-				FileName: file.GetName(),
-				Size:     file.GetSize(),
+				FileName: fileName,
+				Size:     fileSize,
 				FileId:   uploadCompleteResp.Data.FileID,
 				Type:     2,
 				Etag:     etag,
@@ -211,7 +251,10 @@ func (d *Open123) Put(ctx context.Context, dstDir model.Obj, file model.FileStre
 		// 若接口返回的completed为 false 时，则需间隔1秒继续轮询此接口，获取上传最终结果。
 		time.Sleep(time.Second)
 	}
-	return nil, fmt.Errorf("upload complete timeout")
+	
+	log.Errorf("[123open] File: %s - Upload timeout after 60 polls (%v total), PreuploadID: %s",
+		fileName, time.Since(pollStart), createResp.Data.PreuploadID)
+	return nil, fmt.Errorf("upload complete timeout after 60 seconds")
 }
 
 func (d *Open123) GetDetails(ctx context.Context) (*model.StorageDetails, error) {
